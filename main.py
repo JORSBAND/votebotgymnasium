@@ -26,7 +26,7 @@ INITIAL_CODE_GENERATION = os.environ.get("INITIAL_CODE_GENERATION", 'FALSE').upp
 # 🌟 Усі ці значення тепер жорстко задані в коді
 TELEGRAM_BOT_TOKEN = "7710517859:AAFVhcHqe5LqAc98wLhRVrAEc8lW4XhgWuw" # ВАШ ТОКЕН
 WEBHOOK_BASE_URL = "https://school-voting-bot.onrender.com"  # ВАШ ОСНОВНИЙ URL RENDER
-SHEET_NAME = "School_Elections_Bot"  # НАЗВА ВАШОЇ ТАБЛИЦІ GOOGLE SHEETS
+SHEET_NAME = "School_Elections"  # НАЗВА ВАШОЇ ТАБЛИЦІ GOOGLE SHEETS
 KEEP_ALIVE_INTERVAL = 600  # 10 хвилин для Keep-Alive
 # Render автоматично надає змінну PORT, але ми використовуємо 8080 як резерв
 PORT = 8080 
