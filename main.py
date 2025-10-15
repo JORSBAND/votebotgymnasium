@@ -506,7 +506,7 @@ async def main() -> None:
     await runner.setup()
     
     # ВИПРАВЛЕННЯ: Використовуємо PORT, наданий Render, за замовчуванням 8080
-    # Примітка: Render встановлює змінну PORT, якщо вона існує, але ми використовуємо 8080 як резерв
+    # Зчитуємо порт, наданий системою (Render), як пріоритет
     port = int(os.environ.get("PORT", PORT))
     # Біндимо до всіх інтерфейсів (0.0.0.0)
     site = web.TCPSite(runner, '0.0.0.0', port) 
@@ -520,6 +520,7 @@ async def main() -> None:
     await init_webhook(application, WEBHOOK_BASE_URL) 
 
     # 2. Запускаємо веб-сервер
+    # Render має побачити, що ми почали слухати порт
     await site.start()
     logger.info(f"Веб-сервер запущено на http://0.0.0.0:{port}")
     
