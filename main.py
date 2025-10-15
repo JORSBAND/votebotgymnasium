@@ -17,20 +17,19 @@ from typing import Dict, Any, List
 
 # --- ВСТАНОВИТИ ЗАЛЕЖНОСТІ: pip install python-telegram-bot gspread oauth2client aiohttp requests ---
 
-# --- НАЛАШТУВАННЯ СЕКРЕТІВ (ЧИТАЮТЬСЯ З RENDER) ---
-# УВАГА: Замініть ці значення на ваші СЕКРЕТИ в налаштуваннях Render!
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7710517859:AAFVhcHqe5LqAc98wLhRVrAEc8lW4XhgWuw") # PLACEHOLDER
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://school-voting-bot.onrender.com") # PLACEHOLDER
-SHEET_NAME = os.environ.get("SHEET_NAME", "School_Elections_Bot") # PLACEHOLDER
-# Повний JSON-рядок сервісного акаунту Google Sheets
-GSPREAD_SECRET_JSON = os.environ.get("GSPREAD_SECRET_JSON", '{"type": "service_account", "placeholder": "PASTE YOUR FULL JSON HERE"}') # PLACEHOLDER
+# --- КОНФІГУРАЦІЯ СЕКРЕТІВ З RENDER (ТІЛЬКИ ДЛЯ БЕЗПЕЧНИХ КЛЮЧІВ) ---
+# Ці змінні будуть ПЕРЕЗАПИСАНІ у ваших налаштуваннях Render.
+# Якщо вони не встановлені, код використовуватиме заглушку (placeholder).
+GSPREAD_SECRET_JSON = os.environ.get("GSPREAD_SECRET_JSON", '{"type": "service_account", "placeholder": "PASTE YOUR FULL JSON HERE"}') # Секрет
+INITIAL_CODE_GENERATION = os.environ.get("INITIAL_CODE_GENERATION", 'FALSE').upper() # 'TRUE' або 'FALSE'
+
+# --- ОСНОВНА КОНФІГУРАЦІЯ БОТА (В КОДІ) ---
+# 🌟 Усі ці значення тепер жорстко задані в коді
+TELEGRAM_BOT_TOKEN = "7710517859:AAFVhcHqe5LqAc98wLhRVrAEc8lW4XhgWuw" # ВАШ ТОКЕН
+WEBHOOK_BASE_URL = "https://school-voting-bot.onrender.com"  # ВАШ ОСНОВНИЙ URL RENDER
+SHEET_NAME = "School_Elections_Bot"  # НАЗВА ВАШОЇ ТАБЛИЦІ GOOGLE SHEETS
 KEEP_ALIVE_INTERVAL = 600  # 10 хвилин для Keep-Alive
-
-# 🌟 НОВА ЗМІННА ДЛЯ КОНТРОЛЮ ОДНОРАЗОВОГО ЗАПУСКУ
-# Встановіть INITIAL_CODE_GENERATION='TRUE' на Render для першого запуску, потім видаліть її.
-INITIAL_CODE_GENERATION = os.environ.get("INITIAL_CODE_GENERATION", 'FALSE').upper() 
-
-# --- КОНФІГУРАЦІЯ БОТА ---
+PORT = 8080 # ПОРТ ДЛЯ AIOHTTP
 
 # ID адміністраторів, які мають доступ до команди /result
 ADMIN_IDS = [
@@ -40,8 +39,8 @@ ADMIN_IDS = [
 
 # Конфігурація класів для генерації кодів (Класи: Кількість учнів)
 CLASS_CONFIG = {
-    "7-А": 28,
-    "7-Б": 30,
+    "7-А": 17,
+    "7-Б": 29,
     "6-Б": 25,
     "6-А": 27,
     "6-В": 29
@@ -92,9 +91,10 @@ class SheetsManager:
         """Отримує робочий лист (вкладку) за назвою."""
         if not self.is_connected: return None
         try:
-            return await asyncio.to_thread(self.sheet.worksheet, title)
+            ws = await asyncio.to_thread(self.sheet.worksheet, title)
+            return ws
         except gspread.WorksheetNotFound:
-            logger.error(f"❌ Вкладка '{title}' не знайдена в таблиці.")
+            logger.error(f"❌ Критична помилка: Вкладка '{title}' не знайдена в таблиці '{self.sheet_name}'. Перевірте назви вкладок ('Codes' та 'Votes').")
             return None
         except Exception as e:
             logger.error(f"❌ Помилка при отриманні вкладки '{title}': {e}")
@@ -401,10 +401,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def init_webhook(application: Application, url: str) -> None:
     """Встановлює вебхук."""
-    if url:
+    # Правильно формуємо повний WEBHOOK_URL
+    base_url = WEBHOOK_BASE_URL.rstrip('/')
+    full_url = f"{base_url}/{TELEGRAM_BOT_TOKEN}"
+    
+    if full_url:
         try:
-            await application.bot.set_webhook(url=url)
-            logger.info(f"Вебхук успішно встановлено на {url}")
+            await application.bot.set_webhook(url=full_url)
+            logger.info(f"Вебхук успішно встановлено на {full_url}")
         except Exception as e:
             logger.error(f"Не вдалося встановити вебхук: {e}")
 
@@ -414,7 +418,7 @@ async def keep_alive_task(app: web.Application):
     Використовує aiohttp.ClientSession для обходу помилки http_client.
     """
     # URL для пінг-запиту
-    ping_url = f"{WEBHOOK_URL.split(TELEGRAM_BOT_TOKEN)[0]}/status"
+    ping_url = f"{WEBHOOK_BASE_URL.rstrip('/')}/status"
     
     # Створюємо aiohttp.ClientSession один раз
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
@@ -450,8 +454,8 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
 
 async def main() -> None:
     # Перевірка наявності секрету в змінних середовища
-    if not GSPREAD_SECRET_JSON:
-        logger.error("❌ Критична помилка: змінна середовища GSPREAD_SECRET_JSON не знайдена. Робота з Sheets неможлива.")
+    if GSPREAD_SECRET_JSON.startswith('{"type": "service_account", "placeholder": '):
+        logger.error("❌ Критична помилка: Змінна GSPREAD_SECRET_JSON містить заглушку. Будь ласка, замініть її на повний JSON-ключ.")
 
     # Ініціалізація менеджера Google Sheets
     sheets_manager = SheetsManager(GSPREAD_SECRET_JSON, SHEET_NAME)
@@ -499,7 +503,8 @@ async def main() -> None:
     await runner.setup()
     
     # ВИПРАВЛЕННЯ: Використовуємо PORT, наданий Render, за замовчуванням 8080
-    port = int(os.environ.get("PORT", 8080))
+    # Примітка: Render встановлює змінну PORT, якщо вона існує, але ми використовуємо 8080 як резерв
+    port = int(os.environ.get("PORT", PORT))
     # Біндимо до всіх інтерфейсів (0.0.0.0)
     site = web.TCPSite(runner, '0.0.0.0', port) 
 
@@ -508,7 +513,8 @@ async def main() -> None:
     await application.start()
 
     # 1. Встановлюємо вебхук
-    await init_webhook(application, WEBHOOK_URL)
+    # Тут використовується оновлена логіка init_webhook, яка коректно формує повний URL
+    await init_webhook(application, WEBHOOK_BASE_URL) 
 
     # 2. Запускаємо веб-сервер
     await site.start()
