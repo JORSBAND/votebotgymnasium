@@ -1,0 +1,6 @@
+python-telegram-bot
+gspread
+oauth2client
+aiohttp
+requests
+pytz
