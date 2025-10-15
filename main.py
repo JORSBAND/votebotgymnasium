@@ -18,8 +18,7 @@ from typing import Dict, Any, List
 # --- ВСТАНОВИТИ ЗАЛЕЖНОСТІ: pip install python-telegram-bot gspread oauth2client aiohttp requests ---
 
 # --- КОНФІГУРАЦІЯ СЕКРЕТІВ З RENDER (ТІЛЬКИ ДЛЯ БЕЗПЕЧНИХ КЛЮЧІВ) ---
-# Ці змінні будуть ПЕРЕЗАПИСАНІ у ваших налаштуваннях Render.
-# Якщо вони не встановлені, код використовуватиме заглушку (placeholder).
+# Ці змінні будуть читатися з Render.
 GSPREAD_SECRET_JSON = os.environ.get("GSPREAD_SECRET_JSON", '{"type": "service_account", "placeholder": "PASTE YOUR FULL JSON HERE"}') # Секрет
 INITIAL_CODE_GENERATION = os.environ.get("INITIAL_CODE_GENERATION", 'FALSE').upper() # 'TRUE' або 'FALSE'
 
@@ -29,7 +28,8 @@ TELEGRAM_BOT_TOKEN = "7710517859:AAFVhcHqe5LqAc98wLhRVrAEc8lW4XhgWuw" # ВАШ �
 WEBHOOK_BASE_URL = "https://school-voting-bot.onrender.com"  # ВАШ ОСНОВНИЙ URL RENDER
 SHEET_NAME = "School_Elections_Bot"  # НАЗВА ВАШОЇ ТАБЛИЦІ GOOGLE SHEETS
 KEEP_ALIVE_INTERVAL = 600  # 10 хвилин для Keep-Alive
-PORT = 8080 # ПОРТ ДЛЯ AIOHTTP
+# Render автоматично надає змінну PORT, але ми використовуємо 8080 як резерв
+PORT = 8080 
 
 # ID адміністраторів, які мають доступ до команди /result
 ADMIN_IDS = [
@@ -39,8 +39,8 @@ ADMIN_IDS = [
 
 # Конфігурація класів для генерації кодів (Класи: Кількість учнів)
 CLASS_CONFIG = {
-    "7-А": 17,
-    "7-Б": 29,
+    "7-А": 28,
+    "7-Б": 30,
     "6-Б": 25,
     "6-А": 27,
     "6-В": 29
@@ -84,7 +84,8 @@ class SheetsManager:
                 self.is_connected = True
                 logger.info("✅ Успішне підключення до Google Sheets.")
             except Exception as e:
-                logger.error(f"❌ Помилка підключення до Google Sheets: {e}")
+                # Змінюємо логування для більшої інформативності
+                logger.error(f"❌ Критична помилка підключення до Google Sheets. Перевірте GSPREAD_SECRET_JSON, права доступу та назву таблиці '{sheet_name}'. Деталі: {e}")
                 self.is_connected = False
 
     async def get_worksheet(self, title: str):
@@ -156,11 +157,13 @@ async def generate_unique_codes_to_sheets(manager: SheetsManager, config: Dict[s
     # Очистка старої таблиці (крім заголовків)
     try:
         logger.info("Генерація кодів: Очищую існуючі записи...")
+        # Використовуємо методи gspread синхронно через to_thread
         await asyncio.to_thread(codes_ws.resize, rows=1, cols=7) # Зменшуємо до 1 рядка
         await asyncio.to_thread(codes_ws.resize, rows=1000) # Повертаємо багато рядків для майбутніх записів
     except Exception as e:
         logger.error(f"Генерація кодів: Не вдалося очистити стару таблицю Codes: {e}")
-        return
+        # Не зупиняємося, якщо очистка не вдалася, спробуємо оновити заголовки
+        pass
 
     # Заголовки (на випадок, якщо вони були видалені)
     await asyncio.to_thread(codes_ws.update, 'A1:G1', [['Class', 'Student_Count', 'Unique_Code', 'Is_Used', 'Telegram_ID', 'Phone_Number', 'Full_Name']])
