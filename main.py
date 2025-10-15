@@ -12,16 +12,23 @@ from telegram.ext import (
     CallbackQueryHandler, ConversationHandler
 )
 from aiohttp import web
+import aiohttp # Додаємо для коректної роботи ClientSession в keep_alive
 from typing import Dict, Any, List
 
 # --- ВСТАНОВИТИ ЗАЛЕЖНОСТІ: pip install python-telegram-bot gspread oauth2client aiohttp requests ---
 
 # --- НАЛАШТУВАННЯ СЕКРЕТІВ (ЧИТАЮТЬСЯ З RENDER) ---
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-SHEET_NAME = os.environ.get("SHEET_NAME") # Наприклад, "School_Elections"
-GSPREAD_SECRET_JSON = os.environ.get("GSPREAD_SECRET_JSON") # Повний JSON-рядок сервісного акаунту
+# УВАГА: Замініть ці значення на ваші СЕКРЕТИ в налаштуваннях Render!
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7710517859:AAFVhcHqe5LqAc98wLhRVrAEc8lW4XhgWuw") # PLACEHOLDER
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://school-voting-bot.onrender.com") # PLACEHOLDER
+SHEET_NAME = os.environ.get("SHEET_NAME", "School_Elections_Bot") # PLACEHOLDER
+# Повний JSON-рядок сервісного акаунту Google Sheets
+GSPREAD_SECRET_JSON = os.environ.get("GSPREAD_SECRET_JSON", '{"type": "service_account", "placeholder": "PASTE YOUR FULL JSON HERE"}') # PLACEHOLDER
 KEEP_ALIVE_INTERVAL = 600  # 10 хвилин для Keep-Alive
+
+# 🌟 НОВА ЗМІННА ДЛЯ КОНТРОЛЮ ОДНОРАЗОВОГО ЗАПУСКУ
+# Встановіть INITIAL_CODE_GENERATION='TRUE' на Render для першого запуску, потім видаліть її.
+INITIAL_CODE_GENERATION = os.environ.get("INITIAL_CODE_GENERATION", 'FALSE').upper() 
 
 # --- КОНФІГУРАЦІЯ БОТА ---
 
@@ -137,16 +144,22 @@ class SheetsManager:
 
 # --- ОДНОРАЗОВА ФУНКЦІЯ ГЕНЕРАЦІЇ КОДІВ ---
 async def generate_unique_codes_to_sheets(manager: SheetsManager, config: Dict[str, int]):
-    """Генерує унікальні коди на основі CLASS_CONFIG і записує їх у вкладку 'Codes'."""
+    """
+    Генерує унікальні коди на основі CLASS_CONFIG і записує їх у вкладку 'Codes'.
+    УВАГА: Ця функція очищає всі існуючі записи в таблиці 'Codes' перед записом.
+    """
     codes_ws = await manager.get_worksheet("Codes")
-    if codes_ws is None: return
+    if codes_ws is None: 
+        logger.error("Генерація кодів: Не вдалося отримати вкладку 'Codes'.")
+        return
 
     # Очистка старої таблиці (крім заголовків)
     try:
+        logger.info("Генерація кодів: Очищую існуючі записи...")
         await asyncio.to_thread(codes_ws.resize, rows=1, cols=7) # Зменшуємо до 1 рядка
         await asyncio.to_thread(codes_ws.resize, rows=1000) # Повертаємо багато рядків для майбутніх записів
     except Exception as e:
-        logger.error(f"Не вдалося очистити стару таблицю Codes: {e}")
+        logger.error(f"Генерація кодів: Не вдалося очистити стару таблицю Codes: {e}")
         return
 
     # Заголовки (на випадок, якщо вони були видалені)
@@ -165,11 +178,11 @@ async def generate_unique_codes_to_sheets(manager: SheetsManager, config: Dict[s
         try:
             # Масове оновлення даних
             await asyncio.to_thread(codes_ws.append_rows, rows_to_insert)
-            logger.info(f"✅ Успішно згенеровано та записано {len(rows_to_insert)} унікальних кодів.")
+            logger.info(f"✅ Генерація кодів: Успішно згенеровано та записано {len(rows_to_insert)} унікальних кодів.")
         except Exception as e:
-            logger.error(f"❌ Помилка масового запису кодів: {e}")
+            logger.error(f"❌ Генерація кодів: Помилка масового запису кодів: {e}")
 
-# --- ФУНКЦІЇ БОТА ---
+# --- ФУНКЦІЇ БОТА (start, receive_code, receive_contact, handle_vote, show_results, cancel) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Початкова точка, просить користувача ввести унікальний код."""
@@ -258,10 +271,21 @@ async def receive_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if row_num:
         try:
             codes_ws = await manager.get_worksheet("Codes")
-            await asyncio.to_thread(codes_ws.update_cell, row_num, codes_ws.find("Is_Used").col, 'TRUE')
-            await asyncio.to_thread(codes_ws.update_cell, row_num, codes_ws.find("Telegram_ID").col, user.id)
-            await asyncio.to_thread(codes_ws.update_cell, row_num, codes_ws.find("Phone_Number").col, contact.phone_number)
-            await asyncio.to_thread(codes_ws.update_cell, row_num, codes_ws.find("Full_Name").col, f"{user.full_name} (@{user.username or 'N/A'})")
+            # Використовуємо .find() для пошуку колонок для надійності
+            col_is_used = await asyncio.to_thread(codes_ws.find, "Is_Used")
+            col_tg_id = await asyncio.to_thread(codes_ws.find, "Telegram_ID")
+            col_phone = await asyncio.to_thread(codes_ws.find, "Phone_Number")
+            col_full_name = await asyncio.to_thread(codes_ws.find, "Full_Name")
+            
+            if all([col_is_used, col_tg_id, col_phone, col_full_name]):
+                await asyncio.to_thread(codes_ws.update_cell, row_num, col_is_used.col, 'TRUE')
+                await asyncio.to_thread(codes_ws.update_cell, row_num, col_tg_id.col, user.id)
+                await asyncio.to_thread(codes_ws.update_cell, row_num, col_phone.col, contact.phone_number)
+                await asyncio.to_thread(codes_ws.update_cell, row_num, col_full_name.col, f"{user.full_name} (@{user.username or 'N/A'})")
+            else:
+                logger.error("Не знайдено одну з необхідних колонок у вкладці Codes.")
+                raise Exception("Проблема з колонками Sheets.")
+                
         except Exception as e:
             logger.error(f"Помилка оновлення рядка коду: {e}")
             await update.message.reply_text("❌ Виникла помилка під час фіксації реєстрації. Зверніться до адміністратора.")
@@ -385,18 +409,25 @@ async def init_webhook(application: Application, url: str) -> None:
             logger.error(f"Не вдалося встановити вебхук: {e}")
 
 async def keep_alive_task(app: web.Application):
-    """Задача для підтримки активності сервера (Keep-Alive)."""
-    while True:
-        await asyncio.sleep(KEEP_ALIVE_INTERVAL)
-        # Надсилаємо запит до /status endpoint
-        try:
-            async with app['ptb_app'].http_client.get(f"{app['ptb_app'].webhook_url_base}/status", timeout=5) as resp:
-                if resp.status == 200:
-                    logger.info("✅ Keep-Alive успішний.")
-                else:
-                    logger.warning(f"⚠️ Keep-Alive отримав статус: {resp.status}")
-        except Exception as e:
-            logger.error(f"❌ Keep-Alive помилка: {e}")
+    """
+    Задача для підтримки активності сервера (Keep-Alive).
+    Використовує aiohttp.ClientSession для обходу помилки http_client.
+    """
+    # URL для пінг-запиту
+    ping_url = f"{WEBHOOK_URL.split(TELEGRAM_BOT_TOKEN)[0]}/status"
+    
+    # Створюємо aiohttp.ClientSession один раз
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+        while True:
+            await asyncio.sleep(KEEP_ALIVE_INTERVAL)
+            try:
+                async with session.get(ping_url) as resp:
+                    if resp.status == 200:
+                        logger.info("✅ Keep-Alive успішний.")
+                    else:
+                        logger.warning(f"⚠️ Keep-Alive отримав статус: {resp.status}")
+            except Exception as e:
+                logger.error(f"❌ Keep-Alive помилка: {e}")
 
 async def status_handler(request: web.Request) -> web.Response:
     """Endpoint для перевірки статусу (використовується Keep-Alive)."""
@@ -424,6 +455,12 @@ async def main() -> None:
 
     # Ініціалізація менеджера Google Sheets
     sheets_manager = SheetsManager(GSPREAD_SECRET_JSON, SHEET_NAME)
+    
+    # 🌟 АВТОМАТИЧНИЙ ЗАПУСК ГЕНЕРАЦІЇ КОДІВ (ПЕРШИЙ ЗАПУСК)
+    if INITIAL_CODE_GENERATION == 'TRUE' and sheets_manager.is_connected:
+        logger.warning(">>> INITIAL_CODE_GENERATION=TRUE. Виконую одноразову генерацію кодів...")
+        await generate_unique_codes_to_sheets(sheets_manager, CLASS_CONFIG)
+        logger.warning(">>> Одноразову генерацію кодів завершено. ВИДАЛІТЬ змінну INITIAL_CODE_GENERATION з Render, щоб уникнути повторного очищення!")
 
     # --- Створення та налаштування Application ---
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -451,16 +488,20 @@ async def main() -> None:
     web_app['ptb_app'] = application
     web_app.add_routes([
         web.get('/status', status_handler),
-        web.post(f'/{TELEGRAM_BOT_TOKEN}', handle_telegram_webhook)
+        # Використовуємо {TELEGRAM_BOT_TOKEN} у шляху для вебхука
+        web.post(f'/{TELEGRAM_BOT_TOKEN}', handle_telegram_webhook) 
     ])
     
-    # 🌟 ВИПРАВЛЕННЯ: Додаємо keep-alive задачу ДО runner.setup()
+    # ВИПРАВЛЕННЯ: Додаємо keep-alive задачу ДО runner.setup()
     web_app.on_startup.append(lambda app: asyncio.create_task(keep_alive_task(app)))
 
     runner = web.AppRunner(web_app)
     await runner.setup()
+    
+    # ВИПРАВЛЕННЯ: Використовуємо PORT, наданий Render, за замовчуванням 8080
     port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
+    # Біндимо до всіх інтерфейсів (0.0.0.0)
+    site = web.TCPSite(runner, '0.0.0.0', port) 
 
     # --- Запуск ---
     await application.initialize()
@@ -484,37 +525,7 @@ async def main() -> None:
         logger.info("Бот та веб-сервер зупинено.")
 
 if __name__ == '__main__':
-    # --- БЛОК ДЛЯ ОДНОРАЗОВОЇ ГЕНЕРАЦІЇ КОДІВ ---
-    
-    async def initial_setup():
-        """Локальна функція для генерації кодів перед запуском бота на Render."""
-        json_creds = os.environ.get("GSPREAD_SECRET_JSON")
-        sheet_name = os.environ.get("SHEET_NAME")
-        if not json_creds or not sheet_name:
-             print("\n\n❌ ПОМИЛКА: Не встановлені змінні GSPREAD_SECRET_JSON або SHEET_NAME.")
-             print("Переконайтеся, що ви їх експортували в терміналі перед запуском!")
-             return
-
-        print("\n\n⏳ Починаю генерацію унікальних кодів та очищення таблиці Codes...")
-        manager = SheetsManager(json_creds, sheet_name)
-        
-        # Даємо час на асинхронне підключення до Google Sheets
-        await asyncio.sleep(5) 
-        
-        if manager.is_connected:
-            await generate_unique_codes_to_sheets(manager, CLASS_CONFIG)
-            print("\n✅ ГЕНЕРАЦІЮ КОДІВ ЗАВЕРШЕНО. ПЕРЕВІРТЕ ТАБЛИЦЮ GOOGLE SHEETS.")
-        else:
-            print("\n❌ ГЕНЕРАЦІЯ НЕ ВДАЛАСЯ. Перевірте, чи коректно вставлено JSON-ключ.")
-
-
     try:
-        # ЗАУВАЖТЕ: 
-        # 1. Для одноразової генерації локально, РОЗКОМЕНТУЙТЕ рядок нижче і ЗАКОМЕНТУЙТЕ рядок з asyncio.run(main()).
-        # 2. Для запуску бота на Render (чи після генерації), ЗАКОМЕНТУЙТЕ рядок нижче і РОЗКОМЕНТУЙТЕ рядок з asyncio.run(main()).
-        
-        # asyncio.run(initial_setup()) 
-        
         # Запуск бота:
         asyncio.run(main()) 
 
