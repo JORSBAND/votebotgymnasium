@@ -1,44 +1,43 @@
 import os
 import asyncio
+import uuid
 import json
 import logging
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes,
     CallbackQueryHandler, ConversationHandler
 )
-# Бібліотеки для Google Sheets
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-# Бібліотеки для keep-alive та вебхуків
 from aiohttp import web
-import requests
-import pytz
-import uuid
 from typing import Dict, Any, List
 
-# --- Налаштування та Змінні Середовища ---
-# Рекомендується використовувати змінні середовища для секретних ключів
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-# Нова змінна середовища для JSON-ключа Google Sheets
-GSPREAD_SECRET_JSON = os.environ.get("GSPREAD_SECRET_JSON", None) 
-SHEET_NAME = os.environ.get("SHEET_NAME", "School_Elections") # Назва твоєї Google Sheets
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://your-render-app.onrender.com/YOUR_TELEGRAM_BOT_TOKEN")
+# --- ВСТАНОВИТИ ЗАЛЕЖНОСТІ: pip install python-telegram-bot gspread oauth2client aiohttp requests ---
 
-# ID адміністраторів, які можуть бачити результати (/result)
+# --- НАЛАШТУВАННЯ СЕКРЕТІВ (ЧИТАЮТЬСЯ З RENDER) ---
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+SHEET_NAME = os.environ.get("SHEET_NAME") # Наприклад, "School_Elections"
+GSPREAD_SECRET_JSON = os.environ.get("GSPREAD_SECRET_JSON") # Повний JSON-рядок сервісного акаунту
+KEEP_ALIVE_INTERVAL = 600  # 10 хвилин для Keep-Alive
+
+# --- КОНФІГУРАЦІЯ БОТА ---
+
+# ID адміністраторів, які мають доступ до команди /result
 ADMIN_IDS = [
-    838464083,  # Адмін 1
-    6484405296, # Адмін 2
+    838464083,  # Ваш перший ID
+    6484405296, # Ваш другий ID
 ]
 
-# Назви класів та кількість учнів для генерації кодів
+# Конфігурація класів для генерації кодів (Класи: Кількість учнів)
 CLASS_CONFIG = {
-    "7-А": 25,
-    "7-Б": 25,
-    "6-Б": 28,
+    "7-А": 28,
+    "7-Б": 30,
+    "6-Б": 25,
     "6-А": 27,
-    "6-В": 26,
+    "6-В": 29
 }
 
 # Кандидати для голосування
@@ -52,298 +51,229 @@ CANDIDATES = {
 # Стани для ConversationHandler
 (WAITING_FOR_CODE, WAITING_FOR_CONTACT, WAITING_FOR_VOTE) = range(3)
 
-# Логування
+# --- ЛОГУВАННЯ ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Робота з Google Sheets ---
+# --- МЕНЕДЖЕР GOOGLE SHEETS (GSPREAD) ---
 class SheetsManager:
-    # Тепер отримує JSON-рядок замість імені файлу
-    def __init__(self, json_creds: str, sheet_name: str):
-        self.json_creds = json_creds
+    """Клас для безпечної взаємодії з Google Sheets через gspread."""
+    def __init__(self, json_creds_str: str, sheet_name: str):
         self.sheet_name = sheet_name
-        self.client: gspread.Client = None
-        self.codes_sheet: gspread.Worksheet = None
-        self.votes_sheet: gspread.Worksheet = None
         self.is_connected = False
-        asyncio.create_task(self._connect()) # Асинхронне підключення при ініціалізації
+        self.client = None
+        self.sheet = None
 
-    async def _connect(self):
-        """Встановлює з'єднання з Google Sheets асинхронно."""
-        if not self.json_creds:
-             logger.error("❌ Змінна GSPREAD_SECRET_JSON не встановлена. Неможливо підключитися.")
-             return
-             
+        if json_creds_str and sheet_name:
+            try:
+                # 1. Розпарсити JSON-рядок на Python словник
+                creds_dict = json.loads(json_creds_str)
+                # 2. Використовувати словник для авторизації
+                scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+                creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+                self.client = gspread.authorize(creds)
+                
+                # 3. Відкрити таблицю
+                self.sheet = self.client.open(sheet_name)
+                self.is_connected = True
+                logger.info("✅ Успішне підключення до Google Sheets.")
+            except Exception as e:
+                logger.error(f"❌ Помилка підключення до Google Sheets: {e}")
+                self.is_connected = False
+
+    async def get_worksheet(self, title: str):
+        """Отримує робочий лист (вкладку) за назвою."""
+        if not self.is_connected: return None
         try:
-            # 1. Розпаковуємо JSON-рядок
-            creds_dict = json.loads(self.json_creds)
-            
-            # 2. Використовуємо словник для авторизації
-            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            creds = await asyncio.to_thread(ServiceAccountCredentials.from_json_keyfile_dict, creds_dict, scope)
-            
-            self.client = await asyncio.to_thread(gspread.authorize, creds)
-            
-            sheet = await asyncio.to_thread(self.client.open, self.sheet_name)
-            self.codes_sheet = await asyncio.to_thread(sheet.worksheet, "Codes")
-            self.votes_sheet = await asyncio.to_thread(sheet.worksheet, "Votes")
-            self.is_connected = True
-            logger.info("✅ Успішне підключення до Google Sheets.")
-        except json.JSONDecodeError:
-             logger.error("❌ Помилка декодування JSON: перевірте формат GSPREAD_SECRET_JSON.")
-        except Exception as e:
-            logger.error(f"❌ Помилка підключення до Google Sheets: {e}")
-            self.is_connected = False
-
-    async def _ensure_connection(self) -> bool:
-        """Перевіряє і перепідключається, якщо з'єднання втрачено."""
-        if not self.is_connected or not self.client:
-            logger.warning("З'єднання з Google Sheets відсутнє. Спроба перепідключення...")
-            await self._connect()
-        return self.is_connected
-
-    async def find_code(self, unique_code: str) -> Dict[str, Any] | None:
-        """Шукає код і перевіряє його статус."""
-        if not await self._ensure_connection(): return None
-        try:
-            # Отримання всіх кодів. Це швидше, ніж шукати по одному.
-            all_records = await asyncio.to_thread(self.codes_sheet.get_all_records)
-            for row in all_records:
-                if row.get('Unique_Code') == unique_code:
-                    return row
+            return await asyncio.to_thread(self.sheet.worksheet, title)
+        except gspread.WorksheetNotFound:
+            logger.error(f"❌ Вкладка '{title}' не знайдена в таблиці.")
             return None
         except Exception as e:
-            logger.error(f"Помилка пошуку коду: {e}")
+            logger.error(f"❌ Помилка при отриманні вкладки '{title}': {e}")
             return None
 
-    async def mark_code_used(self, unique_code: str, user_data: Dict[str, Any]):
-        """Позначає код як використаний і оновлює дані учня."""
-        if not await self._ensure_connection(): return False
+    async def get_all_records(self, worksheet_title: str) -> List[Dict[str, Any]]:
+        """Отримує всі записи з робочого листа."""
+        ws = await self.get_worksheet(worksheet_title)
+        if ws is None: return []
         try:
-            # Знайдемо рядок, де знаходиться код
-            cell = await asyncio.to_thread(self.codes_sheet.find, unique_code, in_column=3) # Unique_Code у 3-й колонці
-            if not cell: return False
-
-            row_index = cell.row
-            
-            # Оновлюємо дані у відповідних колонках
-            updates = [
-                ('Is_Used', 'TRUE'),
-                ('Telegram_ID', user_data['telegram_id']),
-                ('Phone_Number', user_data['phone_number']),
-                ('Full_Name', user_data['full_name'])
-            ]
-
-            # Використовуємо batch update для швидкості
-            updates_list = []
-            for col_name, value in updates:
-                # Знаходимо індекс колонки за заголовком (припускаємо, що заголовки у першому рядку)
-                headers = await asyncio.to_thread(self.codes_sheet.row_values, 1)
-                try:
-                    col_index = headers.index(col_name) + 1
-                    updates_list.append({
-                        'range': gspread.utils.rowcol_to_a1(row_index, col_index),
-                        'values': [[value]]
-                    })
-                except ValueError:
-                    logger.warning(f"Колонка '{col_name}' не знайдена у таблиці Codes.")
-
-            if updates_list:
-                await asyncio.to_thread(self.codes_sheet.batch_update, updates_list)
-                logger.info(f"Код {unique_code} успішно позначено як використаний.")
-                return True
-            return False
-
+            return await asyncio.to_thread(ws.get_all_records)
         except Exception as e:
-            logger.error(f"Помилка оновлення статусу коду: {e}")
-            return False
+            logger.error(f"❌ Помилка читання даних з '{worksheet_title}': {e}")
+            return []
 
-    async def record_vote(self, code_data: Dict[str, Any], candidate_key: str) -> bool:
-        """Записує голос у таблицю Votes."""
-        if not await self._ensure_connection(): return False
+    async def update_cell(self, worksheet_title: str, row: int, col: int, value: Any):
+        """Оновлює одну клітинку."""
+        ws = await self.get_worksheet(worksheet_title)
+        if ws is None: return False
         try:
-            now = datetime.now(pytz.timezone('Europe/Kyiv')).strftime("%Y-%m-%d %H:%M:%S")
-            vote_row = [
-                now,
-                code_data.get('Class', 'N/A'),
-                code_data.get('Unique_Code', 'N/A'),
-                code_data.get('Telegram_ID', 'N/A'),
-                code_data.get('Username', 'N/A'), # Username ми додаємо з Telegram ID
-                code_data.get('Full_Name', 'N/A'),
-                CANDIDATES.get(candidate_key, 'N/A')
-            ]
-            await asyncio.to_thread(self.votes_sheet.append_row, vote_row)
-            logger.info(f"Голос за {CANDIDATES.get(candidate_key)} успішно записано.")
+            await asyncio.to_thread(ws.update_cell, row, col, value)
             return True
         except Exception as e:
-            logger.error(f"Помилка запису голосу: {e}")
+            logger.error(f"❌ Помилка оновлення клітинки в '{worksheet_title}' (R{row}, C{col}): {e}")
             return False
 
-    async def get_results(self) -> Dict[str, float] | None:
-        """Розраховує результати голосування у відсотках."""
-        if not await self._ensure_connection(): return None
+    async def append_row(self, worksheet_title: str, values: List[Any]):
+        """Додає новий рядок."""
+        ws = await self.get_worksheet(worksheet_title)
+        if ws is None: return False
         try:
-            # Отримуємо всі голоси
-            all_votes_records = await asyncio.to_thread(self.votes_sheet.get_all_records)
-            
-            # Кількість голосів за кожного кандидата
-            vote_counts = {name: 0 for name in CANDIDATES.values()}
-            total_votes = len(all_votes_records)
-
-            for row in all_votes_records:
-                candidate = row.get('Candidate_Voted')
-                if candidate in vote_counts:
-                    vote_counts[candidate] += 1
-            
-            # Розрахунок відсотків
-            results = {}
-            for candidate, count in vote_counts.items():
-                percentage = (count / total_votes) * 100 if total_votes > 0 else 0
-                results[candidate] = percentage
-            
-            return results
-
+            await asyncio.to_thread(ws.append_row, values)
+            return True
         except Exception as e:
-            logger.error(f"Помилка розрахунку результатів: {e}")
-            return None
+            logger.error(f"❌ Помилка додавання рядка до '{worksheet_title}': {e}")
+            return False
+            
+    async def get_all_values(self, worksheet_title: str) -> List[List[Any]]:
+        """Отримує всі значення (включаючи заголовки) з робочого листа."""
+        ws = await self.get_worksheet(worksheet_title)
+        if ws is None: return []
+        try:
+            return await asyncio.to_thread(ws.get_all_values)
+        except Exception as e:
+            logger.error(f"❌ Помилка читання всіх значень з '{worksheet_title}': {e}")
+            return []
 
+# --- ОДНОРАЗОВА ФУНКЦІЯ ГЕНЕРАЦІЇ КОДІВ ---
+async def generate_unique_codes_to_sheets(manager: SheetsManager, config: Dict[str, int]):
+    """Генерує унікальні коди на основі CLASS_CONFIG і записує їх у вкладку 'Codes'."""
+    codes_ws = await manager.get_worksheet("Codes")
+    if codes_ws is None: return
 
-# --- Генерація Унікальних Кодів (Консольна утиліта) ---
-async def generate_unique_codes_to_sheets(sheets_manager: SheetsManager, class_config: Dict[str, int]):
-    """Генерує унікальні коди для кожного учня і записує їх у таблицю Codes."""
-    
-    # Викликається вручну адміністратором
-    
-    if not await sheets_manager._ensure_connection():
-        logger.error("Не вдалося підключитися до Sheets. Коди не згенеровано.")
-        return
-
-    all_codes_to_insert = []
-    
-    # Заголовки, якщо їх немає
-    headers = ["Class", "Student_Count", "Unique_Code", "Is_Used", "Telegram_ID", "Phone_Number", "Full_Name"]
-    
-    # Очистка і вставка заголовків (ВВАЖАЙТЕ, це очистить вміст!)
+    # Очистка старої таблиці (крім заголовків)
     try:
-        await asyncio.to_thread(sheets_manager.codes_sheet.clear)
-        await asyncio.to_thread(sheets_manager.codes_sheet.append_row, headers)
-        logger.info("Таблицю Codes очищено та додано заголовки.")
+        await asyncio.to_thread(codes_ws.resize, rows=1, cols=7) # Зменшуємо до 1 рядка
+        await asyncio.to_thread(codes_ws.resize, rows=1000) # Повертаємо багато рядків для майбутніх записів
     except Exception as e:
-        logger.error(f"Помилка очищення/додавання заголовків: {e}")
+        logger.error(f"Не вдалося очистити стару таблицю Codes: {e}")
         return
 
-    for class_name, count in class_config.items():
+    # Заголовки (на випадок, якщо вони були видалені)
+    await asyncio.to_thread(codes_ws.update, 'A1:G1', [['Class', 'Student_Count', 'Unique_Code', 'Is_Used', 'Telegram_ID', 'Phone_Number', 'Full_Name']])
+    
+    rows_to_insert = []
+    
+    for class_name, count in config.items():
         for _ in range(count):
-            # Генеруємо унікальний код (наприклад, UUID4 без дефісів)
-            unique_code = uuid.uuid4().hex.upper()[:8] 
-            all_codes_to_insert.append([
-                class_name,
-                count,
-                unique_code,
-                'FALSE',
-                '',
-                '',
-                ''
-            ])
+            # Генеруємо 8-значний код на основі UUID
+            unique_code = str(uuid.uuid4()).replace('-', '')[:8].upper()
+            # [Class, Student_Count, Unique_Code, Is_Used, Telegram_ID, Phone_Number, Full_Name]
+            rows_to_insert.append([class_name, count, unique_code, 'FALSE', '', '', ''])
 
-    try:
-        if all_codes_to_insert:
-            await asyncio.to_thread(sheets_manager.codes_sheet.append_rows, all_codes_to_insert)
-            logger.info(f"✅ Успішно згенеровано та додано {len(all_codes_to_insert)} унікальних кодів!")
-        else:
-            logger.warning("Конфігурація класів порожня. Коди не згенеровано.")
-    except Exception as e:
-        logger.error(f"Помилка пакетного додавання кодів: {e}")
+    if rows_to_insert:
+        try:
+            # Масове оновлення даних
+            await asyncio.to_thread(codes_ws.append_rows, rows_to_insert)
+            logger.info(f"✅ Успішно згенеровано та записано {len(rows_to_insert)} унікальних кодів.")
+        except Exception as e:
+            logger.error(f"❌ Помилка масового запису кодів: {e}")
 
+# --- ФУНКЦІЇ БОТА ---
 
-# --- Обробники команд та стани бота ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Надсилає стартове повідомлення та запитує унікальний код."""
+    """Початкова точка, просить користувача ввести унікальний код."""
     user = update.effective_user
-    logger.info(f"Користувач {user.id} почав розмову.")
+    manager: SheetsManager = context.bot_data.get('sheets_manager')
     
-    # Перевіряємо, чи вже проголосував
-    # У цьому прикладі ми це зробимо в наступному кроці для спрощення логіки ConversationHandler
-    
+    if not manager or not manager.is_connected:
+        await update.message.reply_text("❌ Вибачте, сервіс голосування тимчасово недоступний. Спробуйте пізніше.")
+        return ConversationHandler.END
+
+    if user.id in ADMIN_IDS:
+        await update.message.reply_text("Ви адміністратор. Щоб отримати результати, скористайтесь командою /result.")
+        return ConversationHandler.END
+
     await update.message.reply_text(
-        f"🗳️ Вітаємо, {user.first_name}! Це система голосування за президента школи.\n\n"
-        "Для початку голосування, будь ласка, **введіть ваш унікальний код**, який ви отримали у класного керівника. /cancel для скасування."
+        f"🗳️ Вітаємо, {user.first_name}! Для початку голосування, будь ласка, введіть свій **унікальний код** доступу.",
+        reply_markup=ReplyKeyboardRemove()
     )
     return WAITING_FOR_CODE
 
 async def receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отримує унікальний код і перевіряє його в базі."""
-    unique_code = update.message.text.strip().upper()
-    user = update.effective_user
-    
-    if len(unique_code) != 8 or not unique_code.isalnum():
-        await update.message.reply_text("❌ Некоректний формат коду. Будь ласка, введіть **8-значний** унікальний код (букви та цифри).")
+    """Обробляє введений код, перевіряє його валідність та статус."""
+    code = update.message.text.strip().upper()
+    manager: SheetsManager = context.bot_data.get('sheets_manager')
+
+    if len(code) != 8:
+        await update.message.reply_text("❌ Код має складатися рівно з 8 символів. Спробуйте ще раз.")
         return WAITING_FOR_CODE
 
-    sheets_manager: SheetsManager = context.bot_data['sheets_manager']
-    code_data = await sheets_manager.find_code(unique_code)
-    
-    if not code_data:
-        await update.message.reply_text("❌ Цей код **не знайдено** в базі. Перевірте правильність введення або зверніться до класного керівника.")
-        return WAITING_FOR_CODE
-    
-    if code_data.get('Is_Used') == 'TRUE':
-        await update.message.reply_text("❌ Цей код **вже був використаний** для голосування. Ви можете проголосувати лише один раз.")
+    codes_values = await manager.get_all_values("Codes")
+    if not codes_values:
+        await update.message.reply_text("❌ Виникла помилка при доступі до бази кодів. Спробуйте пізніше.")
         return ConversationHandler.END
 
-    context.user_data['unique_code'] = unique_code
-    context.user_data['code_data'] = code_data
+    # Знаходимо код
+    header = codes_values[0]
+    data_rows = codes_values[1:]
 
-    # Запитуємо номер телефону для фіксації в базі
-    keyboard = [[KeyboardButton("Надіслати мій номер телефону 📲", request_contact=True)]]
-    await update.message.reply_text(
-        f"✅ Код прийнято! Ви представляєте клас **{code_data.get('Class', 'N/A')}**.\n\n"
-        "Для остаточної ідентифікації та запису в базу, будь ласка, **натисніть кнопку** і поділіться вашим номером телефону. /cancel для скасування.",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    )
-    return WAITING_FOR_CONTACT
+    context.user_data['code_row_index'] = None
+    context.user_data['code_info'] = None
+    
+    # Індекси колонок
+    col_code = header.index('Unique_Code') + 1
+    col_is_used = header.index('Is_Used') + 1
+
+    for i, row in enumerate(data_rows):
+        # i + 2, оскільки індексація gspread починається з 1, і ми пропускаємо рядок заголовків
+        row_num = i + 2
+        
+        if row[col_code - 1] == code:
+            # Знайдено код
+            context.user_data['code_row_index'] = row_num
+            context.user_data['code_info'] = dict(zip(header, row))
+            
+            if row[col_is_used - 1].upper() == 'TRUE':
+                await update.message.reply_text("❌ Цей код вже був використаний для голосування.")
+                return WAITING_FOR_CODE
+            
+            # Код валідний та не використаний. Просимо номер телефону.
+            context.user_data['unique_code'] = code
+            
+            keyboard = [[KeyboardButton("Надіслати мій номер телефону", request_contact=True)]]
+            await update.message.reply_text(
+                "✅ Код прийнято! Для підтвердження вашої особи, будь ласка, **надішліть свій номер телефону** через кнопку нижче. Це потрібно для ідентифікації.",
+                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+            )
+            return WAITING_FOR_CONTACT
+
+    # Якщо цикл завершився і код не знайдено
+    await update.message.reply_text("❌ Невірний унікальний код. Спробуйте ще раз.")
+    return WAITING_FOR_CODE
 
 async def receive_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отримує контакт, зберігає його і переходить до голосування."""
-    if not update.message.contact or update.message.contact.user_id != update.effective_user.id:
-        await update.message.reply_text("❌ Будь ласка, **натисніть на кнопку** 'Надіслати мій номер телефону' для підтвердження контакту.")
-        return WAITING_FOR_CONTACT
-        
+    """Обробляє отриманий контакт (номер телефону) та пропонує голосувати."""
     contact = update.message.contact
     user = update.effective_user
-    unique_code = context.user_data['unique_code']
-    code_data = context.user_data['code_data']
+    manager: SheetsManager = context.bot_data.get('sheets_manager')
     
-    # Збираємо всі дані для бази
-    user_data_to_store = {
-        'telegram_id': str(user.id),
-        'phone_number': contact.phone_number,
-        'full_name': f"{contact.first_name} {contact.last_name or ''}".strip(),
-        'username': user.username or 'N/A'
-    }
-    
-    # Оновлюємо код унікальності в об'єкті user_data, який буде використано для запису голосу
-    code_data['Telegram_ID'] = user_data_to_store['telegram_id']
-    code_data['Phone_Number'] = user_data_to_store['phone_number']
-    code_data['Full_Name'] = user_data_to_store['full_name']
-    code_data['Username'] = user_data_to_store['username']
-    
-    sheets_manager: SheetsManager = context.bot_data['sheets_manager']
-    
-    # Позначаємо код як використаний у таблиці Codes
-    success = await sheets_manager.mark_code_used(unique_code, user_data_to_store)
+    if contact.user_id != user.id:
+        await update.message.reply_text("❌ Будь ласка, надішліть саме свій номер телефону, використовуючи кнопку.")
+        return WAITING_FOR_CONTACT
 
-    if not success:
-        await update.message.reply_text("❌ Виникла помилка при реєстрації вашого коду в базі. Спробуйте пізніше або зверніться до адміністратора.", reply_markup=ReplyKeyboardRemove())
-        return ConversationHandler.END
+    # 1. Оновлюємо рядок у таблиці Codes
+    row_num = context.user_data.get('code_row_index')
+    
+    if row_num:
+        try:
+            codes_ws = await manager.get_worksheet("Codes")
+            await asyncio.to_thread(codes_ws.update_cell, row_num, codes_ws.find("Is_Used").col, 'TRUE')
+            await asyncio.to_thread(codes_ws.update_cell, row_num, codes_ws.find("Telegram_ID").col, user.id)
+            await asyncio.to_thread(codes_ws.update_cell, row_num, codes_ws.find("Phone_Number").col, contact.phone_number)
+            await asyncio.to_thread(codes_ws.update_cell, row_num, codes_ws.find("Full_Name").col, f"{user.full_name} (@{user.username or 'N/A'})")
+        except Exception as e:
+            logger.error(f"Помилка оновлення рядка коду: {e}")
+            await update.message.reply_text("❌ Виникла помилка під час фіксації реєстрації. Зверніться до адміністратора.")
+            return ConversationHandler.END
 
-    # Формуємо клавіатуру для голосування
+    # 2. Формуємо кнопки для голосування
     keyboard = []
-    for key, name in CANDIDATES.items():
-        keyboard.append([InlineKeyboardButton(name, callback_data=f"vote_{key}")])
-        
+    for key, value in CANDIDATES.items():
+        keyboard.append([InlineKeyboardButton(value, callback_data=f"vote_{key}")])
+
     await update.message.reply_text(
-        "✅ Успішна ідентифікація. Тепер оберіть свого кандидата:",
+        "🤝 Реєстрація успішна! Тепер ви можете віддати свій єдиний голос. **Зробіть свій вибір:**",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return WAITING_FOR_VOTE
@@ -352,109 +282,124 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     """Обробляє вибір кандидата та фіксує голос."""
     query = update.callback_query
     await query.answer()
-    
-    # Перевірка, що це справді колбек голосування
-    if not query.data.startswith("vote_"):
-        await query.edit_message_text("❌ Невідома дія. Спробуйте ще раз, натиснувши кнопку з кандидатом.")
-        return WAITING_FOR_VOTE
 
-    candidate_key = query.data.split("_")[1]
-    candidate_name = CANDIDATES.get(candidate_key)
+    manager: SheetsManager = context.bot_data.get('sheets_manager')
+    user = query.from_user
     
-    if not candidate_name:
-        await query.edit_message_text("❌ Некоректний кандидат. Спробуйте ще раз.")
-        return WAITING_FOR_VOTE
+    # Витягуємо ключ кандидата (наприклад, "Viktoriia Kochut")
+    candidate_key = query.data.replace("vote_", "")
+    candidate_name = CANDIDATES.get(candidate_key, "Невідомий кандидат")
+    
+    code_info = context.user_data.get('code_info', {})
 
-    # Отримання даних, збережених на попередньому кроці
-    code_data = context.user_data.get('code_data')
-    if not code_data:
-        await query.edit_message_text("❌ Помилка: дані про ваш код втрачено. Почніть знову з /start.")
-        return ConversationHandler.END
+    # 1. Записуємо голос у вкладку Votes
+    vote_data = [
+        datetime.now().isoformat(),
+        code_info.get('Class', 'N/A'),
+        context.user_data.get('unique_code', 'N/A'),
+        user.id,
+        user.username or 'N/A',
+        user.full_name,
+        candidate_name
+    ]
+    
+    success = await manager.append_row("Votes", vote_data)
 
-    sheets_manager: SheetsManager = context.bot_data['sheets_manager']
-    
-    # Записуємо голос у таблицю Votes
-    vote_recorded = await sheets_manager.record_vote(code_data, candidate_key)
-    
-    if vote_recorded:
+    if success:
         await query.edit_message_text(
-            f"🎉 **Ваш голос зараховано!**\n\n"
-            f"Ви проголосували за **{candidate_name}**.\n\n"
-            f"Дякуємо за участь у виборах!",
+            f"✅ **Ваш голос зараховано!**\n\nВи проголосували за **{candidate_name}**.",
             reply_markup=None,
             parse_mode='Markdown'
         )
     else:
-        await query.edit_message_text(
-            "❌ Виникла помилка при записі вашого голосу. Спробуйте пізніше або зверніться до адміністратора."
-        )
+        await query.edit_message_text("❌ Виникла помилка під час фіксації вашого голосу. Зверніться до адміністратора.")
 
+    # Очистка даних користувача
     context.user_data.clear()
     return ConversationHandler.END
 
+async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Адміністративна команда: виводить результати голосування у відсотках."""
+    user = update.effective_user
+    manager: SheetsManager = context.bot_data.get('sheets_manager')
+
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Ця команда доступна лише адміністраторам.")
+        return
+
+    await update.message.reply_text("⏳ Збираю та аналізую результати...")
+
+    # 1. Отримуємо всі голоси
+    votes_data = await manager.get_all_records("Votes")
+    if not votes_data:
+        await update.message.reply_text("📊 Наразі жодного голосу не зафіксовано.")
+        return
+
+    total_votes = len(votes_data)
+    vote_counts: Dict[str, int] = {}
+
+    # 2. Підраховуємо голоси за кандидатів
+    for vote in votes_data:
+        candidate = vote.get('Candidate_Voted', 'Невідомий')
+        vote_counts[candidate] = vote_counts.get(candidate, 0) + 1
+
+    # 3. Формуємо вивід результатів
+    results_text = f"📊 **Результати Виборів Президента Школи**\n\n"
+    results_text += f"Всього зарахованих голосів: **{total_votes}**\n\n"
+    
+    sorted_results = sorted(vote_counts.items(), key=lambda item: item[1], reverse=True)
+    
+    for candidate, count in sorted_results:
+        percentage = (count / total_votes) * 100 if total_votes > 0 else 0
+        
+        # Створюємо простий графік за допомогою емодзі
+        blocks = int(percentage / 10)
+        chart = '█' * blocks + '░' * (10 - blocks)
+        
+        results_text += (
+            f"**{candidate}**:\n"
+            f"   {count} голосів ({percentage:.2f}%)\n"
+            f"   `{chart}`\n"
+        )
+        
+    await update.message.reply_text(results_text, parse_mode='Markdown')
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробляє скасування розмови."""
+    """Скасовує активну розмову."""
     await update.effective_message.reply_text(
-        'Операцію скасовано. Для початку голосування знову введіть /start.',
+        'Операцію скасовано.',
         reply_markup=ReplyKeyboardRemove()
     )
     context.user_data.clear()
     return ConversationHandler.END
 
-async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда адміністратора для виведення результатів."""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Ця команда доступна лише адміністраторам.")
-        return
+# --- WEBHOOK ТА KEEP-ALIVE ---
 
-    sheets_manager: SheetsManager = context.bot_data['sheets_manager']
-    
-    if not sheets_manager.is_connected:
-        await update.message.reply_text("❌ Не вдалося підключитися до Google Sheets. Перевірте лог.")
-        return
-
-    await update.message.reply_text("📊 *Обчислюю результати...*", parse_mode='Markdown')
-
-    results = await sheets_manager.get_results()
-    
-    if results is None:
-        await update.message.reply_text("❌ Помилка при отриманні результатів. Перевірте структуру таблиць.")
-        return
-
-    total_votes = sum(results.values()) / 100 if results else 0
-    total_codes = sum(CLASS_CONFIG.values())
-    
-    # Форматування виведення
-    result_text = "📈 **Результати Виборів Президента Школи** 📈\n\n"
-    
-    if results:
-        sorted_results = dict(sorted(results.items(), key=lambda item: item[1], reverse=True))
-        
-        for candidate, percentage in sorted_results.items():
-            result_text += f"**{candidate}**: `{percentage:.2f}%`\n"
-            
-    result_text += (
-        f"\n---\n"
-        f"**Всього голосів (підтверджених):** `{int(total_votes)}`\n"
-        f"**Всього потенційних виборців:** `{total_codes}`"
-    )
-
-    await update.message.reply_text(result_text, parse_mode='Markdown')
-
-# --- Keep-Alive та Вебхук ---
-async def keep_alive_task(app: web.Application):
-    """Задача для підтримки активності бота (keep-alive) на Render. Виконується кожні 10 хвилин."""
-    while True:
+async def init_webhook(application: Application, url: str) -> None:
+    """Встановлює вебхук."""
+    if url:
         try:
-            # Звертаємося до себе, щоб запобігти 'засинанню'
-            await asyncio.to_thread(requests.get, WEBHOOK_URL.rsplit('/', 1)[0] + '/status', timeout=5) 
-            logger.debug("Keep-alive request sent.")
+            await application.bot.set_webhook(url=url)
+            logger.info(f"Вебхук успішно встановлено на {url}")
         except Exception as e:
-            logger.warning(f"Keep-alive failed: {e}")
-        await asyncio.sleep(600) # Виконуємо кожні 10 хвилин (600 секунд)
+            logger.error(f"Не вдалося встановити вебхук: {e}")
+
+async def keep_alive_task(app: web.Application):
+    """Задача для підтримки активності сервера (Keep-Alive)."""
+    while True:
+        await asyncio.sleep(KEEP_ALIVE_INTERVAL)
+        # Надсилаємо запит до /status endpoint
+        try:
+            async with app['ptb_app'].http_client.get(f"{app['ptb_app'].webhook_url_base}/status", timeout=5) as resp:
+                if resp.status == 200:
+                    logger.info("✅ Keep-Alive успішний.")
+                else:
+                    logger.warning(f"⚠️ Keep-Alive отримав статус: {resp.status}")
+        except Exception as e:
+            logger.error(f"❌ Keep-Alive помилка: {e}")
 
 async def status_handler(request: web.Request) -> web.Response:
-    """Простий обробник для keep-alive запитів."""
+    """Endpoint для перевірки статусу (використовується Keep-Alive)."""
     return web.Response(text="Bot is running", status=200)
 
 async def handle_telegram_webhook(request: web.Request) -> web.Response:
@@ -471,11 +416,6 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     except Exception as e:
         logger.error(f"Помилка в обробнику вебхука: {e}")
         return web.Response(status=500)
-
-async def init_webhook(application: Application, webhook_url: str):
-    """Встановлює вебхук."""
-    await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
-    logger.info(f"Вебхук успішно встановлено на {webhook_url}")
 
 async def main() -> None:
     # Перевірка наявності секрету в змінних середовища
@@ -494,7 +434,8 @@ async def main() -> None:
         entry_points=[CommandHandler("start", start)],
         states={
             WAITING_FOR_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_code)],
-            WAITING_FOR_CONTACT: [MessageHandler(filters.CONTACT, receive_contact)],
+            # Фільтр для кнопки "Надіслати контакт"
+            WAITING_FOR_CONTACT: [MessageHandler(filters.CONTACT, receive_contact)], 
             WAITING_FOR_VOTE: [CallbackQueryHandler(handle_vote, pattern='^vote_.*$')]
         },
         fallbacks=[CommandHandler('cancel', cancel)],
@@ -513,6 +454,9 @@ async def main() -> None:
         web.post(f'/{TELEGRAM_BOT_TOKEN}', handle_telegram_webhook)
     ])
     
+    # 🌟 ВИПРАВЛЕННЯ: Додаємо keep-alive задачу ДО runner.setup()
+    web_app.on_startup.append(lambda app: asyncio.create_task(keep_alive_task(app)))
+
     runner = web.AppRunner(web_app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
@@ -529,9 +473,6 @@ async def main() -> None:
     await site.start()
     logger.info(f"Веб-сервер запущено на http://0.0.0.0:{port}")
     
-    # 3. Додаємо keep-alive задачу
-    web_app.on_startup.append(lambda app: asyncio.create_task(keep_alive_task(app)))
-
     # Головний цикл для підтримки роботи
     try:
         while True:
@@ -543,21 +484,39 @@ async def main() -> None:
         logger.info("Бот та веб-сервер зупинено.")
 
 if __name__ == '__main__':
+    # --- БЛОК ДЛЯ ОДНОРАЗОВОЇ ГЕНЕРАЦІЇ КОДІВ ---
+    
+    async def initial_setup():
+        """Локальна функція для генерації кодів перед запуском бота на Render."""
+        json_creds = os.environ.get("GSPREAD_SECRET_JSON")
+        sheet_name = os.environ.get("SHEET_NAME")
+        if not json_creds or not sheet_name:
+             print("\n\n❌ ПОМИЛКА: Не встановлені змінні GSPREAD_SECRET_JSON або SHEET_NAME.")
+             print("Переконайтеся, що ви їх експортували в терміналі перед запуском!")
+             return
+
+        print("\n\n⏳ Починаю генерацію унікальних кодів та очищення таблиці Codes...")
+        manager = SheetsManager(json_creds, sheet_name)
+        
+        # Даємо час на асинхронне підключення до Google Sheets
+        await asyncio.sleep(5) 
+        
+        if manager.is_connected:
+            await generate_unique_codes_to_sheets(manager, CLASS_CONFIG)
+            print("\n✅ ГЕНЕРАЦІЮ КОДІВ ЗАВЕРШЕНО. ПЕРЕВІРТЕ ТАБЛИЦЮ GOOGLE SHEETS.")
+        else:
+            print("\n❌ ГЕНЕРАЦІЯ НЕ ВДАЛАСЯ. Перевірте, чи коректно вставлено JSON-ключ.")
+
+
     try:
-        # Для першого запуску, щоб згенерувати коди, розкоментуйте цей блок та запустіть окремо
-        # import gspread
-        # import asyncio
-        # async def initial_setup():
-        #     # УВАГА: Щоб запустити цей блок, GSPREAD_SECRET_JSON також має бути встановлено у вашому локальному середовищі!
-        #     manager = SheetsManager(GSPREAD_SECRET_JSON, SHEET_NAME)
-        #     # Даємо час на підключення
-        #     await asyncio.sleep(5) 
-        #     await generate_unique_codes_to_sheets(manager, CLASS_CONFIG)
-        # 
+        # ЗАУВАЖТЕ: 
+        # 1. Для одноразової генерації локально, РОЗКОМЕНТУЙТЕ рядок нижче і ЗАКОМЕНТУЙТЕ рядок з asyncio.run(main()).
+        # 2. Для запуску бота на Render (чи після генерації), ЗАКОМЕНТУЙТЕ рядок нижче і РОЗКОМЕНТУЙТЕ рядок з asyncio.run(main()).
+        
         # asyncio.run(initial_setup()) 
         
-        # Після генерації кодів запускайте основний main()
-        asyncio.run(main())
+        # Запуск бота:
+        asyncio.run(main()) 
 
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот зупинено вручну.")
