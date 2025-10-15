@@ -21,14 +21,15 @@ from typing import Dict, Any, List
 # --- Налаштування та Змінні Середовища ---
 # Рекомендується використовувати змінні середовища для секретних ключів
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-SHEETS_CREDENTIALS_FILE = os.environ.get("SHEETS_CREDENTIALS_FILE", "sheets_creds.json") # Назва твого JSON ключа
+# Нова змінна середовища для JSON-ключа Google Sheets
+GSPREAD_SECRET_JSON = os.environ.get("GSPREAD_SECRET_JSON", None) 
 SHEET_NAME = os.environ.get("SHEET_NAME", "School_Elections") # Назва твоєї Google Sheets
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://your-render-app.onrender.com/YOUR_TELEGRAM_BOT_TOKEN")
 
 # ID адміністраторів, які можуть бачити результати (/result)
 ADMIN_IDS = [
-    12345678, # Заміни на свій Telegram ID
-    87654321  # Додай інші ID
+    838464083,  # Адмін 1
+    6484405296, # Адмін 2
 ]
 
 # Назви класів та кількість учнів для генерації кодів
@@ -57,8 +58,9 @@ logger = logging.getLogger(__name__)
 
 # --- Робота з Google Sheets ---
 class SheetsManager:
-    def __init__(self, creds_file: str, sheet_name: str):
-        self.creds_file = creds_file
+    # Тепер отримує JSON-рядок замість імені файлу
+    def __init__(self, json_creds: str, sheet_name: str):
+        self.json_creds = json_creds
         self.sheet_name = sheet_name
         self.client: gspread.Client = None
         self.codes_sheet: gspread.Worksheet = None
@@ -68,10 +70,18 @@ class SheetsManager:
 
     async def _connect(self):
         """Встановлює з'єднання з Google Sheets асинхронно."""
+        if not self.json_creds:
+             logger.error("❌ Змінна GSPREAD_SECRET_JSON не встановлена. Неможливо підключитися.")
+             return
+             
         try:
-            # Використовуємо to_thread, щоб не блокувати Event Loop
+            # 1. Розпаковуємо JSON-рядок
+            creds_dict = json.loads(self.json_creds)
+            
+            # 2. Використовуємо словник для авторизації
             scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            creds = await asyncio.to_thread(ServiceAccountCredentials.from_json_keyfile_name, self.creds_file, scope)
+            creds = await asyncio.to_thread(ServiceAccountCredentials.from_json_keyfile_dict, creds_dict, scope)
+            
             self.client = await asyncio.to_thread(gspread.authorize, creds)
             
             sheet = await asyncio.to_thread(self.client.open, self.sheet_name)
@@ -79,6 +89,8 @@ class SheetsManager:
             self.votes_sheet = await asyncio.to_thread(sheet.worksheet, "Votes")
             self.is_connected = True
             logger.info("✅ Успішне підключення до Google Sheets.")
+        except json.JSONDecodeError:
+             logger.error("❌ Помилка декодування JSON: перевірте формат GSPREAD_SECRET_JSON.")
         except Exception as e:
             logger.error(f"❌ Помилка підключення до Google Sheets: {e}")
             self.is_connected = False
@@ -466,15 +478,12 @@ async def init_webhook(application: Application, webhook_url: str):
     logger.info(f"Вебхук успішно встановлено на {webhook_url}")
 
 async def main() -> None:
-    # Перевірка наявності файлу з ключем
-    if not os.path.exists(SHEETS_CREDENTIALS_FILE):
-        logger.error(f"Файл {SHEETS_CREDENTIALS_FILE} не знайдено. Голосування не працюватиме.")
-        # Залишаємо заглушку для запуску бота, але функціонал Sheets буде недоступний
-        with open(SHEETS_CREDENTIALS_FILE, 'w') as f:
-            f.write('{"placeholder": "replace with actual service account json"}')
+    # Перевірка наявності секрету в змінних середовища
+    if not GSPREAD_SECRET_JSON:
+        logger.error("❌ Критична помилка: змінна середовища GSPREAD_SECRET_JSON не знайдена. Робота з Sheets неможлива.")
 
     # Ініціалізація менеджера Google Sheets
-    sheets_manager = SheetsManager(SHEETS_CREDENTIALS_FILE, SHEET_NAME)
+    sheets_manager = SheetsManager(GSPREAD_SECRET_JSON, SHEET_NAME)
 
     # --- Створення та налаштування Application ---
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -539,7 +548,8 @@ if __name__ == '__main__':
         # import gspread
         # import asyncio
         # async def initial_setup():
-        #     manager = SheetsManager(SHEETS_CREDENTIALS_FILE, SHEET_NAME)
+        #     # УВАГА: Щоб запустити цей блок, GSPREAD_SECRET_JSON також має бути встановлено у вашому локальному середовищі!
+        #     manager = SheetsManager(GSPREAD_SECRET_JSON, SHEET_NAME)
         #     # Даємо час на підключення
         #     await asyncio.sleep(5) 
         #     await generate_unique_codes_to_sheets(manager, CLASS_CONFIG)
